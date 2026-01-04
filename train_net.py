@@ -1,3 +1,15 @@
+from detectron2.data.datasets import register_coco_instances
+DATASET_TRAIN_NAME = 'manga_train'
+DATASET_VAL_NAME = 'manga_val'
+DATASET_TRAIN_JSON = 'D:/Projects/Manga/data/_datasets/af_240501/train/coco.json'
+DATASET_VAL_JSON = 'D:/Projects/Manga/data/_datasets/af_240501/val/coco.json'
+DATASET_TRAIN_IMAGE_ROOT = 'D:/Projects/Manga/data/_datasets/af_240501/train'
+DATASET_VAL_IMAGE_ROOT = 'D:/Projects/Manga/data/_datasets/af_240501/val'
+
+register_coco_instances(DATASET_TRAIN_NAME, {}, DATASET_TRAIN_JSON, DATASET_TRAIN_IMAGE_ROOT)
+register_coco_instances(DATASET_VAL_NAME, {}, DATASET_VAL_JSON, DATASET_VAL_IMAGE_ROOT)
+
+
 # ------------------------------------------------------------------------
 # Copyright (c) 2022 IDEA. All Rights Reserved.
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
@@ -10,7 +22,7 @@ try:
     from shapely.errors import ShapelyDeprecationWarning
     import warnings
     warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
-except:
+except BaseException:
     pass
 
 import copy
@@ -70,6 +82,7 @@ class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
     """
+
     def __init__(self, cfg):
         super(DefaultTrainer, self).__init__()
         logger = logging.getLogger("detectron2")
