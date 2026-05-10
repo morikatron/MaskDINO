@@ -1,0 +1,51 @@
+_BASE_: border_head_semantic_2601_ref.yaml
+
+OUTPUT_DIR: ./output/border_head_semantic_2601_multitask_taskgated
+
+DATASETS:
+  TRAIN: ("manga_train", "manga_border_semantic_train_split")
+  TEST: ("manga_val", "manga_border_semantic_val_split")
+
+INPUT:
+  DATASET_MAPPER_NAME: "manga_multitask"
+  IMAGE_SIZE: 1024
+  MIN_SCALE: 0.5
+  MAX_SCALE: 1.5
+
+MODEL:
+  WEIGHTS: "output/251210_baseline/model_final.pth"
+  BORDER_HEAD:
+    ENABLED: True
+    TRAIN_ONLY: False
+    FREEZE_BASE: False
+    HIDDEN_DIM: 256
+    IMAGE_HIDDEN_DIM: 64
+    FULL_RES_HIDDEN_DIM: 64
+    LOSS_WEIGHT: 1.0
+    BCE_WEIGHT: 0.25
+    DICE_WEIGHT: 1.0
+    POS_WEIGHT: 4.0
+  MaskDINO:
+    TEST:
+      SEMANTIC_ON: True
+      INSTANCE_ON: True
+      PANOPTIC_ON: False
+      OVERLAP_THRESHOLD: 0.8
+      OBJECT_MASK_THRESHOLD: 0.25
+      SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE: True
+
+SOLVER:
+  IMS_PER_BATCH: 2
+  BASE_LR: 5.0e-05
+  BASE_LR_END: 5.0e-06
+  MAX_ITER: 1500
+  CHECKPOINT_PERIOD: 300
+  AMP:
+    ENABLED: True
+
+DATALOADER:
+  FILTER_EMPTY_ANNOTATIONS: False
+  NUM_WORKERS: 2
+
+TEST:
+  EVAL_PERIOD: 300

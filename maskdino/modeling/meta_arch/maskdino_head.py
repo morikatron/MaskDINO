@@ -15,6 +15,7 @@ from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 
 from ..transformer_decoder.maskdino_decoder import build_transformer_decoder
 from ..pixel_decoder.maskdino_encoder import build_pixel_decoder
+from .border_head import BorderSemanticHead
 
 
 @SEM_SEG_HEADS_REGISTRY.register()
@@ -29,6 +30,8 @@ class MaskDINOHead(nn.Module):
         loss_weight: float = 1.0,
         ignore_value: int = -1,
         transformer_predictor: nn.Module,
+        border_head: Optional[nn.Module] = None,
+        border_train_only: bool = False,
     ):
         """
         Args:
@@ -49,8 +52,11 @@ class MaskDINOHead(nn.Module):
 
         self.pixel_decoder = pixel_decoder
         self.predictor = transformer_predictor
+        self.border_head = border_head
+        self.border_train_only = border_train_only
 
         self.num_classes = num_classes
+        self.border_low_level_feature = self.in_features[0]
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -69,14 +75,39 @@ class MaskDINOHead(nn.Module):
                 transformer_predictor_in_channels,
                 mask_classification=True,
             ),
+            "border_head": (
+                BorderSemanticHead(
+                    mask_dim=cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
+                    low_level_channels=input_shape[cfg.MODEL.SEM_SEG_HEAD.IN_FEATURES[0]].channels,
+                    hidden_dim=cfg.MODEL.BORDER_HEAD.HIDDEN_DIM,
+                    image_hidden_dim=cfg.MODEL.BORDER_HEAD.IMAGE_HIDDEN_DIM,
+                    full_res_hidden_dim=cfg.MODEL.BORDER_HEAD.FULL_RES_HIDDEN_DIM,
+                )
+                if cfg.MODEL.BORDER_HEAD.ENABLED
+                else None
+            ),
+            "border_train_only": cfg.MODEL.BORDER_HEAD.TRAIN_ONLY,
         }
 
-    def forward(self, features, mask=None,targets=None):
-        return self.layers(features, mask,targets=targets)
+    def forward(self, features, mask=None, targets=None, images=None):
+        return self.layers(features, mask, targets=targets, images=images)
 
-    def layers(self, features, mask=None,targets=None):
+    def layers(self, features, mask=None, targets=None, images=None):
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features, mask)
 
-        predictions = self.predictor(multi_scale_features, mask_features, mask, targets=targets)
+        if self.training and self.border_train_only:
+            predictions = {}
+            mask_dict = {}
+        else:
+            predictions, mask_dict = self.predictor(multi_scale_features, mask_features, mask, targets=targets)
 
-        return predictions
+        if self.border_head is not None:
+            output_size = images.shape[-2:] if images is not None else None
+            predictions["border_logits"] = self.border_head(
+                mask_features,
+                features[self.border_low_level_feature],
+                images,
+                output_size=output_size,
+            )
+
+        return predictions, mask_dict

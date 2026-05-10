@@ -1,13 +1,95 @@
-from detectron2.data.datasets import register_coco_instances
+import os
+
+import cv2
+import numpy as np
+
+from detectron2.data import DatasetCatalog, MetadataCatalog
+from detectron2.data.datasets import load_sem_seg, register_coco_instances
+from detectron2.data.detection_utils import read_image
 DATASET_TRAIN_NAME = 'manga_train'
 DATASET_VAL_NAME = 'manga_val'
 DATASET_TRAIN_JSON = 'D:/Projects/Manga/data/_datasets/af_240501/train/coco.json'
 DATASET_VAL_JSON = 'D:/Projects/Manga/data/_datasets/af_240501/val/coco.json'
 DATASET_TRAIN_IMAGE_ROOT = 'D:/Projects/Manga/data/_datasets/af_240501/train'
 DATASET_VAL_IMAGE_ROOT = 'D:/Projects/Manga/data/_datasets/af_240501/val'
+DATASET_BORDER_TRAIN_NAME = 'manga_border_semantic_train'
+DATASET_BORDER_TRAIN_SPLIT_NAME = 'manga_border_semantic_train_split'
+DATASET_BORDER_VAL_SPLIT_NAME = 'manga_border_semantic_val_split'
+DATASET_BORDER_IMAGE_ROOT = 'D:/Projects/Manga/data/_datasets/semantic_2601/images'
+DATASET_BORDER_MASK_ROOT = 'D:/Projects/Manga/data/_datasets/semantic_2601/masks'
 
-register_coco_instances(DATASET_TRAIN_NAME, {}, DATASET_TRAIN_JSON, DATASET_TRAIN_IMAGE_ROOT)
-register_coco_instances(DATASET_VAL_NAME, {}, DATASET_VAL_JSON, DATASET_VAL_IMAGE_ROOT)
+
+def _list_border_dataset_filenames(image_root, mask_root):
+    names = []
+    for name in sorted(os.listdir(image_root)):
+        image_path = os.path.join(image_root, name)
+        mask_path = os.path.join(mask_root, name)
+        if os.path.isfile(image_path) and os.path.isfile(mask_path):
+            names.append(name)
+    return names
+
+
+def _load_border_sem_seg_subset(image_root, mask_root, selected_names):
+    selected = set(selected_names)
+    dataset = load_sem_seg(mask_root, image_root, gt_ext='png', image_ext='png')
+    return [record for record in dataset if os.path.basename(record["file_name"]) in selected]
+
+
+def _register_border_semantic_dataset(name, image_root, mask_root, selected_names=None):
+    if name in DatasetCatalog.list():
+        return
+    if selected_names is None:
+        DatasetCatalog.register(
+            name,
+            lambda: load_sem_seg(
+                mask_root,
+                image_root,
+                gt_ext='png',
+                image_ext='png',
+            ),
+        )
+    else:
+        selected_names = tuple(selected_names)
+        DatasetCatalog.register(
+            name,
+            lambda selected_names=selected_names: _load_border_sem_seg_subset(
+                image_root,
+                mask_root,
+                selected_names,
+            ),
+        )
+    MetadataCatalog.get(name).set(
+        stuff_classes=['background', 'border'],
+        evaluator_type='manga_border_sem_seg',
+        ignore_label=255,
+        image_root=image_root,
+        sem_seg_root=mask_root,
+    )
+
+if DATASET_TRAIN_NAME not in DatasetCatalog.list():
+    register_coco_instances(DATASET_TRAIN_NAME, {}, DATASET_TRAIN_JSON, DATASET_TRAIN_IMAGE_ROOT)
+if DATASET_VAL_NAME not in DatasetCatalog.list():
+    register_coco_instances(DATASET_VAL_NAME, {}, DATASET_VAL_JSON, DATASET_VAL_IMAGE_ROOT)
+_register_border_semantic_dataset(
+    DATASET_BORDER_TRAIN_NAME,
+    DATASET_BORDER_IMAGE_ROOT,
+    DATASET_BORDER_MASK_ROOT,
+)
+_border_names = _list_border_dataset_filenames(DATASET_BORDER_IMAGE_ROOT, DATASET_BORDER_MASK_ROOT)
+_border_train_split = [name for index, name in enumerate(_border_names) if index % 10 != 0]
+_border_val_split = [name for index, name in enumerate(_border_names) if index % 10 == 0]
+_register_border_semantic_dataset(
+    DATASET_BORDER_TRAIN_SPLIT_NAME,
+    DATASET_BORDER_IMAGE_ROOT,
+    DATASET_BORDER_MASK_ROOT,
+    _border_train_split,
+)
+_register_border_semantic_dataset(
+    DATASET_BORDER_VAL_SPLIT_NAME,
+    DATASET_BORDER_IMAGE_ROOT,
+    DATASET_BORDER_MASK_ROOT,
+    _border_val_split,
+)
 
 
 # ------------------------------------------------------------------------
@@ -28,8 +110,6 @@ except BaseException:
 import copy
 import itertools
 import logging
-import os
-
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
 
@@ -56,9 +136,11 @@ from detectron2.utils.logger import setup_logger
 
 # MaskDINO
 from maskdino import (
+    BorderSemSegEvaluator,
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
+    MangaMultiTaskDatasetMapper,
     MaskFormerSemanticDatasetMapper,
     SemanticSegmentorWithTTA,
     add_maskdino_config,
@@ -67,6 +149,7 @@ from maskdino import (
 import random
 from detectron2.engine import (
     DefaultTrainer,
+    DefaultPredictor,
     default_argument_parser,
     default_setup,
     hooks,
@@ -76,6 +159,12 @@ from detectron2.engine import (
     SimpleTrainer
 )
 import weakref
+
+from maskdino.utils.border_inference import predict_border_with_padding
+
+
+def _is_border_semantic_dataset(dataset_name):
+    return dataset_name.startswith("manga_border_semantic")
 
 
 class Trainer(DefaultTrainer):
@@ -92,6 +181,7 @@ class Trainer(DefaultTrainer):
 
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
+        self.freeze_modules_for_border_head(cfg, model)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
@@ -127,6 +217,50 @@ class Trainer(DefaultTrainer):
         )
         # TODO: release GPU cluster submit scripts based on submitit for multi-node training
 
+    @staticmethod
+    def freeze_modules_for_border_head(cfg, model):
+        border_cfg = getattr(cfg.MODEL, "BORDER_HEAD", None)
+        if border_cfg is None or not border_cfg.ENABLED:
+            return
+
+        if border_cfg.TRAIN_ONLY and not border_cfg.FREEZE_BASE:
+            logging.getLogger("detectron2").warning(
+                "MODEL.BORDER_HEAD.TRAIN_ONLY=True and FREEZE_BASE=False. "
+                "This will update instance-related weights as well."
+            )
+
+        if not border_cfg.FREEZE_BASE:
+            return
+
+        for param in model.parameters():
+            param.requires_grad = False
+
+        border_head = getattr(model.sem_seg_head, "border_head", None)
+        if border_head is None:
+            raise ValueError("MODEL.BORDER_HEAD.ENABLED is True, but no border head was built.")
+
+        for param in border_head.parameters():
+            param.requires_grad = True
+
+        if getattr(border_cfg, "UNFREEZE_PIXEL_DECODER", False):
+            pixel_decoder = getattr(model.sem_seg_head, "pixel_decoder", None)
+            if pixel_decoder is None:
+                raise ValueError(
+                    "MODEL.BORDER_HEAD.UNFREEZE_PIXEL_DECODER is True, but no pixel decoder was built."
+                )
+            for param in pixel_decoder.parameters():
+                param.requires_grad = True
+
+        num_trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+        logger = logging.getLogger("detectron2")
+        if getattr(border_cfg, "UNFREEZE_PIXEL_DECODER", False):
+            logger.info(
+                "Frozen base model except border head and pixel decoder; trainable params: %d",
+                num_trainable,
+            )
+        else:
+            logger.info("Frozen base model; trainable border-head params: %d", num_trainable)
+
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
         """
@@ -140,6 +274,12 @@ class Trainer(DefaultTrainer):
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        if evaluator_type == "manga_border_sem_seg":
+            return BorderSemSegEvaluator(
+                dataset_name,
+                distributed=True,
+                output_dir=output_folder,
+            )
         # semantic segmentation
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
@@ -226,6 +366,9 @@ class Trainer(DefaultTrainer):
         # Semantic segmentation dataset mapper
         elif cfg.INPUT.DATASET_MAPPER_NAME == "mask_former_semantic":
             mapper = MaskFormerSemanticDatasetMapper(cfg, True)
+            return build_detection_train_loader(cfg, mapper=mapper)
+        elif cfg.INPUT.DATASET_MAPPER_NAME == "manga_multitask":
+            mapper = MangaMultiTaskDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper=mapper)
         else:
             mapper = None
@@ -353,6 +496,119 @@ def setup(args):
     return cfg
 
 
+def _colorize_border_prob(prob_map):
+    prob_map = np.asarray(prob_map, dtype=np.float32)
+    max_value = float(prob_map.max()) if prob_map.size else 0.0
+    if max_value <= 0.0:
+        heat = np.zeros_like(prob_map, dtype=np.uint8)
+    else:
+        heat = np.clip((prob_map / max_value) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(heat, cv2.COLORMAP_TURBO)
+
+
+def export_border_val_predictions(cfg, weights_path):
+    if not cfg.MODEL.BORDER_HEAD.ENABLED or len(cfg.DATASETS.TEST) == 0:
+        return
+
+    logger = logging.getLogger("detectron2")
+
+    export_cfg = cfg.clone()
+    export_cfg.defrost()
+    export_cfg.MODEL.WEIGHTS = weights_path
+    export_cfg.MODEL.MaskDINO.TEST.INSTANCE_ON = True
+    export_cfg.freeze()
+
+    predictor = DefaultPredictor(export_cfg)
+    fixed_size = int(getattr(export_cfg.INPUT.BORDER_SEMANTIC, "FIXED_SIZE", 0))
+    pad_value = int(getattr(export_cfg.INPUT.BORDER_SEMANTIC, "PAD_VALUE", 255))
+    threshold = 0.5
+
+    saved_dirs = []
+    for dataset_name in export_cfg.DATASETS.TEST:
+        if not _is_border_semantic_dataset(dataset_name):
+            continue
+
+        output_dir = os.path.join(cfg.OUTPUT_DIR, "val_predictions", dataset_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        for record in DatasetCatalog.get(dataset_name):
+            image = read_image(record["file_name"], format="BGR")
+            predictions = predictor(image)
+
+            border_pred = predictions.get("border_sem_seg")
+            if fixed_size > 0 and border_pred is not None:
+                restored = predict_border_with_padding(predictor, image, fixed_size, pad_value)
+                if restored is not None:
+                    border_pred = restored
+
+            if border_pred is None:
+                continue
+
+            if isinstance(border_pred, torch.Tensor):
+                border_pred = border_pred.detach().cpu().numpy()
+            if border_pred.ndim == 3:
+                border_pred = border_pred[0]
+            border_pred = np.clip(border_pred, 0.0, 1.0)
+
+            heatmap = _colorize_border_prob(border_pred)
+            heat_overlay = cv2.addWeighted(image, 0.55, heatmap, 0.45, 0.0)
+            binary = (border_pred >= threshold).astype(np.uint8) * 255
+            binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            binary_overlay = cv2.addWeighted(image, 0.55, binary_bgr, 0.45, 0.0)
+            panel = np.concatenate([image, heat_overlay, binary_overlay], axis=1)
+
+            file_stem = os.path.splitext(os.path.basename(record["file_name"]))[0]
+            out_path = os.path.join(output_dir, file_stem + "_panel.png")
+            cv2.imwrite(out_path, panel)
+
+        saved_dirs.append(output_dir)
+
+    if saved_dirs:
+        logger.info("Saved border validation predictions to %s", ", ".join(saved_dirs))
+
+
+def run_dual_box_source_eval(cfg, model, args):
+    box_sources = list(getattr(cfg.MODEL.MaskDINO.TEST, "BOX_EVAL_SOURCES", ["pred"]))
+    if len(box_sources) == 0:
+        box_sources = ["pred"]
+
+    if not cfg.MODEL.MaskDINO.TEST.INSTANCE_ON or len(box_sources) == 1:
+        results = Trainer.test(cfg, model)
+        if cfg.TEST.AUG.ENABLED:
+            results.update(Trainer.test_with_TTA(cfg, model))
+        return results
+
+    box_source_owner = model.module if hasattr(model, "module") else model
+    original_box_source = getattr(box_source_owner, "instance_box_source", None)
+    merged_results = OrderedDict()
+    try:
+        for box_source in box_sources:
+            eval_cfg = cfg.clone()
+            eval_cfg.defrost()
+            eval_cfg.MODEL.MaskDINO.TEST.BOX_INFERENCE_SOURCE = box_source
+            eval_cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, f"eval_box_{box_source}")
+            eval_cfg.freeze()
+
+            if original_box_source is not None:
+                box_source_owner.instance_box_source = box_source
+
+            results = Trainer.test(eval_cfg, model)
+            if cfg.TEST.AUG.ENABLED:
+                tta_results = Trainer.test_with_TTA(eval_cfg, model)
+                results.update(tta_results)
+
+            for dataset_name, dataset_results in results.items():
+                if isinstance(dataset_results, dict):
+                    merged_results[f"{dataset_name}_box_{box_source}"] = dataset_results
+                else:
+                    merged_results[f"{dataset_name}_box_{box_source}"] = dataset_results
+    finally:
+        if original_box_source is not None:
+            box_source_owner.instance_box_source = original_box_source
+
+    return merged_results
+
+
 def main(args):
     cfg = setup(args)
     print("Command cfg:", cfg)
@@ -365,16 +621,17 @@ def main(args):
         checkpointer.resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model)
-        if cfg.TEST.AUG.ENABLED:
-            res.update(Trainer.test_with_TTA(cfg, model))
+        res = run_dual_box_source_eval(cfg, model, args)
         if comm.is_main_process():
             verify_results(cfg, res)
         return res
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
-    return trainer.train()
+    train_result = trainer.train()
+    if comm.is_main_process():
+        export_border_val_predictions(cfg, os.path.join(cfg.OUTPUT_DIR, "model_final.pth"))
+    return train_result
 
 
 if __name__ == "__main__":

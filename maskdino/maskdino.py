@@ -52,7 +52,14 @@ class MaskDINO(nn.Module):
         pano_temp: float,
         focus_on_box: bool = False,
         transform_eval: bool = False,
+        instance_box_source: str = "pred",
         semantic_ce_loss: bool = False,
+        border_head_enabled: bool = False,
+        border_train_only: bool = False,
+        border_loss_weight: float = 1.0,
+        border_bce_weight: float = 1.0,
+        border_dice_weight: float = 1.0,
+        border_pos_weight: float = 8.0,
     ):
         """
         Args:
@@ -106,7 +113,14 @@ class MaskDINO(nn.Module):
         self.data_loader = data_loader
         self.focus_on_box = focus_on_box
         self.transform_eval = transform_eval
+        self.instance_box_source = instance_box_source
         self.semantic_ce_loss = semantic_ce_loss
+        self.border_head_enabled = border_head_enabled
+        self.border_train_only = border_train_only
+        self.border_loss_weight = border_loss_weight
+        self.border_bce_weight = border_bce_weight
+        self.border_dice_weight = border_dice_weight
+        self.border_pos_weight = border_pos_weight
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -211,13 +225,64 @@ class MaskDINO(nn.Module):
             "data_loader": cfg.INPUT.DATASET_MAPPER_NAME,
             "focus_on_box": cfg.MODEL.MaskDINO.TEST.TEST_FOUCUS_ON_BOX,
             "transform_eval": cfg.MODEL.MaskDINO.TEST.PANO_TRANSFORM_EVAL,
+            "instance_box_source": cfg.MODEL.MaskDINO.TEST.BOX_INFERENCE_SOURCE,
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
-            "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+            "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+            "border_head_enabled": cfg.MODEL.BORDER_HEAD.ENABLED,
+            "border_train_only": cfg.MODEL.BORDER_HEAD.TRAIN_ONLY,
+            "border_loss_weight": cfg.MODEL.BORDER_HEAD.LOSS_WEIGHT,
+            "border_bce_weight": cfg.MODEL.BORDER_HEAD.BCE_WEIGHT,
+            "border_dice_weight": cfg.MODEL.BORDER_HEAD.DICE_WEIGHT,
+            "border_pos_weight": cfg.MODEL.BORDER_HEAD.POS_WEIGHT,
         }
 
     @property
     def device(self):
         return self.pixel_mean.device
+
+    @staticmethod
+    def _infer_task_type(input_per_image):
+        if "task_type" in input_per_image:
+            return input_per_image["task_type"]
+        if "sem_seg" in input_per_image:
+            return "border"
+        return "instance"
+
+    @staticmethod
+    def _slice_batch_outputs(outputs, indices, batch_size):
+        if len(indices) == batch_size:
+            return outputs
+
+        def _slice_value(value, index_tensor):
+            if torch.is_tensor(value):
+                if value.dim() > 0 and value.shape[0] == batch_size:
+                    return value.index_select(0, index_tensor)
+                return value
+            if isinstance(value, list):
+                return [_slice_value(item, index_tensor) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_slice_value(item, index_tensor) for item in value)
+            if isinstance(value, dict):
+                return {key: _slice_value(item, index_tensor) for key, item in value.items()}
+            return value
+
+        device = None
+        for value in outputs.values():
+            if torch.is_tensor(value):
+                device = value.device
+                break
+            if isinstance(value, dict):
+                for nested_value in value.values():
+                    if torch.is_tensor(nested_value):
+                        device = nested_value.device
+                        break
+                if device is not None:
+                    break
+        if device is None:
+            device = torch.device("cpu")
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=device)
+        return {key: _slice_value(value, index_tensor) for key, value in outputs.items()}
 
     def forward(self, batched_inputs):
         """
@@ -262,43 +327,58 @@ class MaskDINO(nn.Module):
                     targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
-            outputs,mask_dict = self.sem_seg_head(features,targets=targets)
-            # bipartite matching-based loss
-            losses = self.criterion(outputs, targets,mask_dict)
+            outputs,mask_dict = self.sem_seg_head(features, targets=targets, images=images.tensor)
+            task_types = [self._infer_task_type(x) for x in batched_inputs]
+            instance_indices = [i for i, task_type in enumerate(task_types) if task_type == "instance"]
+            border_indices = [i for i, task_type in enumerate(task_types) if task_type == "border"]
+            losses = {}
+            if not self.border_train_only and len(instance_indices) > 0:
+                # bipartite matching-based loss
+                instance_outputs = self._slice_batch_outputs(outputs, instance_indices, len(batched_inputs))
+                instance_targets = [targets[i] for i in instance_indices]
+                losses = self.criterion(instance_outputs, instance_targets, None)
 
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+                for k in list(losses.keys()):
+                    if k in self.criterion.weight_dict:
+                        losses[k] *= self.criterion.weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        losses.pop(k)
+            if self.border_head_enabled and len(border_indices) > 0:
+                border_logits = outputs["border_logits"]
+                if border_logits is not None and len(border_indices) != len(batched_inputs):
+                    border_logits = border_logits[border_indices]
+                border_inputs = [batched_inputs[i] for i in border_indices]
+                losses.update(self.compute_border_losses(border_logits, border_inputs))
             return losses
         else:
-            outputs, _ = self.sem_seg_head(features)
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
-            mask_box_results = outputs["pred_boxes"]
+            outputs, _ = self.sem_seg_head(features, images=images.tensor)
+            border_logits_results = outputs.get("border_logits")
+            mask_cls_results = outputs.get("pred_logits")
+            mask_pred_results = outputs.get("pred_masks")
+            mask_box_results = outputs.get("pred_boxes")
             # upsample masks
-            mask_pred_results = F.interpolate(
-                mask_pred_results,
-                size=(images.tensor.shape[-2], images.tensor.shape[-1]),
-                mode="bilinear",
-                align_corners=False,
-            )
+            if mask_pred_results is not None:
+                mask_pred_results = F.interpolate(
+                    mask_pred_results,
+                    size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
-            ):  # image_size is augmented size, not divisible to 32
+            for image_index, (input_per_image, image_size) in enumerate(zip(batched_inputs, images.image_sizes)):
+                mask_cls_result = None if mask_cls_results is None else mask_cls_results[image_index]
+                mask_pred_result = None if mask_pred_results is None else mask_pred_results[image_index]
+                mask_box_result = None if mask_box_results is None else mask_box_results[image_index]
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
-                new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
+                new_size = image_size
 
-
-                if self.sem_seg_postprocess_before_inference:
+                if mask_pred_result is not None and self.sem_seg_postprocess_before_inference:
                     mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
                         mask_pred_result, image_size, height, width
                     )
@@ -306,21 +386,29 @@ class MaskDINO(nn.Module):
                     # mask_box_result = mask_box_result.to(mask_pred_result)
                     # mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
+                if border_logits_results is not None:
+                    border_pred_result = border_logits_results[image_index, :, : image_size[0], : image_size[1]]
+                    if self.sem_seg_postprocess_before_inference:
+                        border_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            border_pred_result, image_size, height, width
+                        )
+                    processed_results[-1]["border_sem_seg"] = border_pred_result.sigmoid()
+
                 # semantic segmentation inference
-                if self.semantic_on:
+                if self.semantic_on and mask_pred_result is not None:
                     r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
 
                 # panoptic segmentation inference
-                if self.panoptic_on:
+                if self.panoptic_on and mask_pred_result is not None:
                     panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
 
                 # instance segmentation inference
 
-                if self.instance_on:
+                if self.instance_on and mask_pred_result is not None:
                     mask_box_result = mask_box_result.to(mask_pred_result)
                     height = new_size[0]/image_size[0]*height
                     width = new_size[1]/image_size[1]*width
@@ -330,6 +418,48 @@ class MaskDINO(nn.Module):
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
+
+    def compute_border_losses(self, border_logits, batched_inputs):
+        losses = {}
+        if border_logits is None:
+            return losses
+
+        bce_loss = border_logits.new_tensor(0.0)
+        dice_loss = border_logits.new_tensor(0.0)
+        valid_images = 0
+        pos_weight = torch.tensor([self.border_pos_weight], device=border_logits.device)
+
+        for pred_per_image, input_per_image in zip(border_logits, batched_inputs):
+            if "sem_seg" not in input_per_image:
+                continue
+            target = input_per_image["sem_seg"].to(border_logits.device)
+            if target.dim() == 3:
+                target = target.squeeze(0)
+            h, w = target.shape[-2:]
+            pred_per_image = pred_per_image[:, :h, :w]
+            target = (target > 0).float().unsqueeze(0)
+            bce_loss = bce_loss + F.binary_cross_entropy_with_logits(
+                pred_per_image,
+                target,
+                pos_weight=pos_weight,
+            )
+            dice_loss = dice_loss + self.binary_dice_loss(pred_per_image, target)
+            valid_images += 1
+
+        if valid_images == 0:
+            return losses
+
+        normalizer = float(valid_images)
+        losses["loss_border_bce"] = self.border_loss_weight * self.border_bce_weight * (bce_loss / normalizer)
+        losses["loss_border_dice"] = self.border_loss_weight * self.border_dice_weight * (dice_loss / normalizer)
+        return losses
+
+    @staticmethod
+    def binary_dice_loss(logits, targets, eps=1e-6):
+        probs = logits.sigmoid()
+        intersection = (probs * targets).sum()
+        denominator = probs.sum() + targets.sum()
+        return 1.0 - (2.0 * intersection + eps) / (denominator + eps)
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -472,13 +602,17 @@ class MaskDINO(nn.Module):
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
-        # half mask box half pred box
-        mask_box_result = mask_box_result[topk_indices]
+        pred_box_result = mask_box_result[topk_indices]
         if self.panoptic_on:
-            mask_box_result = mask_box_result[keep]
-        result.pred_boxes = Boxes(mask_box_result)
-        # Uncomment the following to get boxes from masks (this is slow)
-        # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+            pred_box_result = pred_box_result[keep]
+        if self.instance_box_source == "mask":
+            result.pred_boxes = BitMasks(result.pred_masks > 0.5).get_bounding_boxes()
+        elif self.instance_box_source == "pred":
+            result.pred_boxes = Boxes(pred_box_result)
+        else:
+            raise ValueError(
+                f"Unsupported MODEL.MaskDINO.TEST.BOX_INFERENCE_SOURCE: {self.instance_box_source}"
+            )
 
         # calculate average mask prob
         mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)

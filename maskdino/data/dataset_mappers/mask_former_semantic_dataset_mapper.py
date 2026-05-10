@@ -2,6 +2,7 @@
 import copy
 import logging
 
+import cv2
 import numpy as np
 import torch
 from torch.nn import functional as F
@@ -38,6 +39,12 @@ class MaskFormerSemanticDatasetMapper:
         image_format,
         ignore_label,
         size_divisibility,
+        binary_from_255=False,
+        threshold=127,
+        upscale_factor=1.0,
+        fixed_size=0,
+        pad_value=255,
+        dilate_kernel=0,
     ):
         """
         NOTE: this interface is experimental.
@@ -53,6 +60,12 @@ class MaskFormerSemanticDatasetMapper:
         self.img_format = image_format
         self.ignore_label = ignore_label
         self.size_divisibility = size_divisibility
+        self.binary_from_255 = binary_from_255
+        self.threshold = threshold
+        self.upscale_factor = upscale_factor
+        self.fixed_size = fixed_size
+        self.pad_value = pad_value
+        self.dilate_kernel = dilate_kernel
 
         logger = logging.getLogger(__name__)
         mode = "training" if is_train else "inference"
@@ -92,6 +105,12 @@ class MaskFormerSemanticDatasetMapper:
             "image_format": cfg.INPUT.FORMAT,
             "ignore_label": ignore_label,
             "size_divisibility": cfg.INPUT.SIZE_DIVISIBILITY,
+            "binary_from_255": cfg.INPUT.BORDER_SEMANTIC.BINARY_FROM_255,
+            "threshold": cfg.INPUT.BORDER_SEMANTIC.THRESHOLD,
+            "upscale_factor": cfg.INPUT.BORDER_SEMANTIC.UPSCALE_FACTOR,
+            "fixed_size": cfg.INPUT.BORDER_SEMANTIC.FIXED_SIZE,
+            "pad_value": cfg.INPUT.BORDER_SEMANTIC.PAD_VALUE,
+            "dilate_kernel": cfg.INPUT.BORDER_SEMANTIC.DILATE_KERNEL,
         }
         return ret
 
@@ -122,6 +141,37 @@ class MaskFormerSemanticDatasetMapper:
                 )
             )
 
+        if self.binary_from_255:
+            sem_seg_gt = (sem_seg_gt >= self.threshold).astype("double")
+
+        if self.upscale_factor != 1.0:
+            new_h = max(1, int(round(image.shape[0] * self.upscale_factor)))
+            new_w = max(1, int(round(image.shape[1] * self.upscale_factor)))
+
+            image_tensor = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).unsqueeze(0).float()
+            image_tensor = F.interpolate(
+                image_tensor,
+                size=(new_h, new_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            image = image_tensor.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
+
+            sem_seg_tensor = torch.as_tensor(np.ascontiguousarray(sem_seg_gt)).unsqueeze(0).unsqueeze(0).float()
+            sem_seg_tensor = F.interpolate(
+                sem_seg_tensor,
+                size=(new_h, new_w),
+                mode="nearest",
+            )
+            sem_seg_gt = sem_seg_tensor.squeeze(0).squeeze(0).numpy()
+
+        if self.fixed_size > 0:
+            image, sem_seg_gt = self._resize_and_pad(image, sem_seg_gt, self.fixed_size)
+
+        if self.dilate_kernel > 1:
+            kernel = np.ones((self.dilate_kernel, self.dilate_kernel), dtype=np.uint8)
+            sem_seg_gt = cv2.dilate(sem_seg_gt.astype(np.uint8), kernel, iterations=1).astype(sem_seg_gt.dtype)
+
         aug_input = T.AugInput(image, sem_seg=sem_seg_gt)
         aug_input, transforms = T.apply_transform_gens(self.tfm_gens, aug_input)
         image = aug_input.image
@@ -134,11 +184,13 @@ class MaskFormerSemanticDatasetMapper:
 
         if self.size_divisibility > 0:
             image_size = (image.shape[-2], image.shape[-1])
+            pad_h = (self.size_divisibility - image_size[0] % self.size_divisibility) % self.size_divisibility
+            pad_w = (self.size_divisibility - image_size[1] % self.size_divisibility) % self.size_divisibility
             padding_size = [
                 0,
-                self.size_divisibility - image_size[1],
+                pad_w,
                 0,
-                self.size_divisibility - image_size[0],
+                pad_h,
             ]
             image = F.pad(image, padding_size, value=128).contiguous()
             if sem_seg_gt is not None:
@@ -184,3 +236,40 @@ class MaskFormerSemanticDatasetMapper:
             dataset_dict["instances"] = instances
 
         return dataset_dict
+
+    def _resize_and_pad(self, image, sem_seg_gt, size):
+        scale = min(size / float(image.shape[0]), size / float(image.shape[1]))
+        new_h = max(1, int(round(image.shape[0] * scale)))
+        new_w = max(1, int(round(image.shape[1] * scale)))
+
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1))).unsqueeze(0).float()
+        image_tensor = F.interpolate(
+            image_tensor,
+            size=(new_h, new_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        image_resized = image_tensor.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().numpy()
+        image_padded = np.full((size, size, 3), self.pad_value, dtype=np.uint8)
+        image_padded[:new_h, :new_w] = image_resized
+
+        sem_seg_tensor = torch.as_tensor(np.ascontiguousarray(sem_seg_gt)).unsqueeze(0).unsqueeze(0).float()
+        if self.binary_from_255:
+            sem_seg_tensor = F.interpolate(
+                sem_seg_tensor,
+                size=(new_h, new_w),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            sem_seg_tensor = F.interpolate(
+                sem_seg_tensor,
+                size=(new_h, new_w),
+                mode="nearest",
+            )
+        sem_seg_resized = sem_seg_tensor.squeeze(0).squeeze(0).numpy()
+        if self.binary_from_255:
+            sem_seg_resized = (sem_seg_resized > 0).astype(np.float32)
+        sem_seg_padded = np.zeros((size, size), dtype=sem_seg_resized.dtype)
+        sem_seg_padded[:new_h, :new_w] = sem_seg_resized
+        return image_padded, sem_seg_padded

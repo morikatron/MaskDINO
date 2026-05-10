@@ -18,6 +18,7 @@ from .data.dataset_mappers.detr_dataset_mapper import DetrDatasetMapper
 from .data.dataset_mappers.mask_former_semantic_dataset_mapper import (
     MaskFormerSemanticDatasetMapper,
 )
+from .data.dataset_mappers.manga_multitask_dataset_mapper import MangaMultiTaskDatasetMapper
 
 # models
 from .maskdino import MaskDINO
@@ -25,6 +26,7 @@ from .maskdino import MaskDINO
 from .test_time_augmentation import SemanticSegmentorWithTTA
 
 # evaluation
+from .evaluation.border_sem_seg_evaluation import BorderSemSegEvaluator
 from .evaluation.instance_evaluation import InstanceSegEvaluator
 # util
 from .utils import box_ops, misc, utils

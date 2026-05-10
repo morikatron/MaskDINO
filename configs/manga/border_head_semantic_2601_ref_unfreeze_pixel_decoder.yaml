@@ -1,0 +1,8 @@
+_BASE_: border_head_semantic_2601_ref.yaml
+
+OUTPUT_DIR: ./output/border_head_semantic_2601_ref_unfreeze_pixel_decoder
+
+MODEL:
+  BORDER_HEAD:
+    FREEZE_BASE: True
+    UNFREEZE_PIXEL_DECODER: True
