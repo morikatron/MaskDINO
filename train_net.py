@@ -506,6 +506,30 @@ def _colorize_border_prob(prob_map):
     return cv2.applyColorMap(heat, cv2.COLORMAP_TURBO)
 
 
+def export_inference_checkpoint(full_checkpoint_path, output_path=None):
+    logger = logging.getLogger("detectron2")
+
+    if not os.path.isfile(full_checkpoint_path):
+        logger.warning("Full checkpoint not found: %s", full_checkpoint_path)
+        return None
+
+    if output_path is None:
+        root, ext = os.path.splitext(full_checkpoint_path)
+        output_path = root + "_inference" + ext
+
+    checkpoint = torch.load(full_checkpoint_path, map_location="cpu")
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        inference_checkpoint = {"model": checkpoint["model"]}
+        if "iteration" in checkpoint:
+            inference_checkpoint["iteration"] = checkpoint["iteration"]
+    else:
+        inference_checkpoint = {"model": checkpoint}
+
+    torch.save(inference_checkpoint, output_path)
+    logger.info("Saved inference-only checkpoint to %s", output_path)
+    return output_path
+
+
 def export_border_val_predictions(cfg, weights_path):
     if not cfg.MODEL.BORDER_HEAD.ENABLED or len(cfg.DATASETS.TEST) == 0:
         return
@@ -630,7 +654,9 @@ def main(args):
     trainer.resume_or_load(resume=args.resume)
     train_result = trainer.train()
     if comm.is_main_process():
-        export_border_val_predictions(cfg, os.path.join(cfg.OUTPUT_DIR, "model_final.pth"))
+        final_weights = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
+        inference_weights = export_inference_checkpoint(final_weights)
+        export_border_val_predictions(cfg, inference_weights or final_weights)
     return train_result
 
 

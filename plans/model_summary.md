@@ -96,21 +96,25 @@ flowchart TD
 - border-only / frozen:
   - 出力: [output/border_head_semantic_2601_ref_split_frozen_fixedpad](../output/border_head_semantic_2601_ref_split_frozen_fixedpad)
   - checkpoint: [output/border_head_semantic_2601_ref_split_frozen_fixedpad/model_final.pth](../output/border_head_semantic_2601_ref_split_frozen_fixedpad/model_final.pth)
+  - inference checkpoint: [output/border_head_semantic_2601_ref_split_frozen_fixedpad/model_final_inference.pth](../output/border_head_semantic_2601_ref_split_frozen_fixedpad/model_final_inference.pth)
   - log: [output/border_head_semantic_2601_ref_split_frozen_fixedpad/log.txt](../output/border_head_semantic_2601_ref_split_frozen_fixedpad/log.txt)
 
 - border-only / pixel decoder 非凍結:
   - 出力: [output/border_head_semantic_2601_ref_unfreeze_pixel_decoder](../output/border_head_semantic_2601_ref_unfreeze_pixel_decoder)
   - checkpoint: [output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/model_final.pth](../output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/model_final.pth)
+  - inference checkpoint: [output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/model_final_inference.pth](../output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/model_final_inference.pth)
   - log: [output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/log.txt](../output/border_head_semantic_2601_ref_unfreeze_pixel_decoder/log.txt)
 
 - multitask / 旧実装:
   - 出力: [output/border_head_semantic_2601_multitask_eval](../output/border_head_semantic_2601_multitask_eval)
   - checkpoint: [output/border_head_semantic_2601_multitask_eval/model_final.pth](../output/border_head_semantic_2601_multitask_eval/model_final.pth)
+  - inference checkpoint: [output/border_head_semantic_2601_multitask_eval/model_final_inference.pth](../output/border_head_semantic_2601_multitask_eval/model_final_inference.pth)
   - log: [output/border_head_semantic_2601_multitask_eval/log.txt](../output/border_head_semantic_2601_multitask_eval/log.txt)
 
 - multitask / task-gated 修正版:
   - 出力: [output/border_head_semantic_2601_multitask_taskgated](../output/border_head_semantic_2601_multitask_taskgated)
   - checkpoint: [output/border_head_semantic_2601_multitask_taskgated/model_final.pth](../output/border_head_semantic_2601_multitask_taskgated/model_final.pth)
+  - inference checkpoint: [output/border_head_semantic_2601_multitask_taskgated/model_final_inference.pth](../output/border_head_semantic_2601_multitask_taskgated/model_final_inference.pth)
   - log: [output/border_head_semantic_2601_multitask_taskgated/log.txt](../output/border_head_semantic_2601_multitask_taskgated/log.txt)
 
 #### 再評価 run
@@ -118,6 +122,7 @@ flowchart TD
 - baseline / box 2 ルート再評価:
   - 出力: [output/baseline_eval_box_routes_512_fixed](../output/baseline_eval_box_routes_512_fixed)
   - log: [output/baseline_eval_box_routes_512_fixed/log.txt](../output/baseline_eval_box_routes_512_fixed/log.txt)
+  - baseline inference checkpoint: [output/251210_baseline/model_final_inference.pth](../output/251210_baseline/model_final_inference.pth)
 
 - border-only / frozen / box 2 ルート再評価:
   - 出力: [output/border_head_semantic_2601_ref_split_frozen_fixedpad_eval_box_routes_fixed](../output/border_head_semantic_2601_ref_split_frozen_fixedpad_eval_box_routes_fixed)
