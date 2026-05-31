@@ -133,6 +133,7 @@ from detectron2.evaluation import (
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
+from detectron2.utils.visualizer import ColorMode, Visualizer
 
 # MaskDINO
 from maskdino import (
@@ -182,6 +183,7 @@ class Trainer(DefaultTrainer):
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
         self.freeze_modules_for_border_head(cfg, model)
+        self.freeze_modules_for_instance_refine(cfg, model)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
@@ -260,6 +262,30 @@ class Trainer(DefaultTrainer):
             )
         else:
             logger.info("Frozen base model; trainable border-head params: %d", num_trainable)
+
+    @staticmethod
+    def freeze_modules_for_instance_refine(cfg, model):
+        refine_cfg = getattr(cfg.MODEL, "INSTANCE_MASK_REFINE", None)
+        if refine_cfg is None or not refine_cfg.ENABLED or not refine_cfg.FREEZE_BASE:
+            return
+
+        for param in model.parameters():
+            param.requires_grad = False
+
+        refine_head = getattr(model.sem_seg_head, "instance_mask_refine_head", None)
+        if refine_head is None:
+            raise ValueError(
+                "MODEL.INSTANCE_MASK_REFINE.ENABLED is True, but no instance mask refine head was built."
+            )
+
+        for param in refine_head.parameters():
+            param.requires_grad = True
+
+        num_trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+        logging.getLogger("detectron2").info(
+            "Frozen base model; trainable instance-refine params: %d",
+            num_trainable,
+        )
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name, output_folder=None):
@@ -591,44 +617,104 @@ def export_border_val_predictions(cfg, weights_path):
         logger.info("Saved border validation predictions to %s", ", ".join(saved_dirs))
 
 
-def run_dual_box_source_eval(cfg, model, args):
+def export_instance_val_predictions(cfg, weights_path):
+    if not cfg.MODEL.MaskDINO.TEST.INSTANCE_ON or len(cfg.DATASETS.TEST) == 0:
+        return
+
+    logger = logging.getLogger("detectron2")
+
+    export_cfg = cfg.clone()
+    export_cfg.defrost()
+    export_cfg.MODEL.WEIGHTS = weights_path
+    export_cfg.freeze()
+
+    predictor = DefaultPredictor(export_cfg)
+    saved_dirs = []
+    for dataset_name in export_cfg.DATASETS.TEST:
+        evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
+        if evaluator_type not in {"coco", "coco_panoptic_seg"}:
+            continue
+
+        metadata = MetadataCatalog.get(dataset_name)
+        output_dir = os.path.join(cfg.OUTPUT_DIR, "val_predictions", dataset_name)
+        os.makedirs(output_dir, exist_ok=True)
+
+        for record in DatasetCatalog.get(dataset_name):
+            image_bgr = read_image(record["file_name"], format="BGR")
+            predictions = predictor(image_bgr)
+
+            original_panel = image_bgr
+            vis = Visualizer(
+                image_bgr[:, :, ::-1],
+                metadata=metadata,
+                instance_mode=ColorMode.IMAGE,
+            )
+            if "instances" in predictions:
+                rendered = vis.draw_instance_predictions(predictions["instances"].to("cpu")).get_image()
+            else:
+                rendered = image_bgr[:, :, ::-1]
+            prediction_panel = rendered[:, :, ::-1]
+            panel = np.concatenate([original_panel, prediction_panel], axis=1)
+
+            file_stem = os.path.splitext(os.path.basename(record["file_name"]))[0]
+            out_path = os.path.join(output_dir, file_stem + "_panel.png")
+            cv2.imwrite(out_path, panel)
+
+        saved_dirs.append(output_dir)
+
+    if saved_dirs:
+        logger.info("Saved instance validation predictions to %s", ", ".join(saved_dirs))
+
+
+def run_multi_source_instance_eval(cfg, model, args):
     box_sources = list(getattr(cfg.MODEL.MaskDINO.TEST, "BOX_EVAL_SOURCES", ["pred"]))
+    mask_sources = list(getattr(cfg.MODEL.MaskDINO.TEST, "MASK_EVAL_SOURCES", ["auto"]))
     if len(box_sources) == 0:
         box_sources = ["pred"]
+    if len(mask_sources) == 0:
+        mask_sources = ["auto"]
 
-    if not cfg.MODEL.MaskDINO.TEST.INSTANCE_ON or len(box_sources) == 1:
+    if not cfg.MODEL.MaskDINO.TEST.INSTANCE_ON or (len(box_sources) == 1 and len(mask_sources) == 1):
         results = Trainer.test(cfg, model)
         if cfg.TEST.AUG.ENABLED:
             results.update(Trainer.test_with_TTA(cfg, model))
         return results
 
-    box_source_owner = model.module if hasattr(model, "module") else model
-    original_box_source = getattr(box_source_owner, "instance_box_source", None)
+    source_owner = model.module if hasattr(model, "module") else model
+    original_box_source = getattr(source_owner, "instance_box_source", None)
+    original_mask_source = getattr(source_owner, "instance_mask_source", None)
     merged_results = OrderedDict()
     try:
-        for box_source in box_sources:
-            eval_cfg = cfg.clone()
-            eval_cfg.defrost()
-            eval_cfg.MODEL.MaskDINO.TEST.BOX_INFERENCE_SOURCE = box_source
-            eval_cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, f"eval_box_{box_source}")
-            eval_cfg.freeze()
-
-            if original_box_source is not None:
-                box_source_owner.instance_box_source = box_source
-
-            results = Trainer.test(eval_cfg, model)
-            if cfg.TEST.AUG.ENABLED:
-                tta_results = Trainer.test_with_TTA(eval_cfg, model)
-                results.update(tta_results)
-
-            for dataset_name, dataset_results in results.items():
-                if isinstance(dataset_results, dict):
-                    merged_results[f"{dataset_name}_box_{box_source}"] = dataset_results
+        for mask_source in mask_sources:
+            for box_source in box_sources:
+                eval_cfg = cfg.clone()
+                eval_cfg.defrost()
+                eval_cfg.MODEL.MaskDINO.TEST.MASK_INFERENCE_SOURCE = mask_source
+                eval_cfg.MODEL.MaskDINO.TEST.BOX_INFERENCE_SOURCE = box_source
+                if len(mask_sources) == 1:
+                    eval_cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, f"eval_box_{box_source}")
                 else:
-                    merged_results[f"{dataset_name}_box_{box_source}"] = dataset_results
+                    eval_cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, f"eval_mask_{mask_source}_box_{box_source}")
+                eval_cfg.freeze()
+
+                if original_mask_source is not None:
+                    source_owner.instance_mask_source = mask_source
+                if original_box_source is not None:
+                    source_owner.instance_box_source = box_source
+
+                results = Trainer.test(eval_cfg, model)
+                if cfg.TEST.AUG.ENABLED:
+                    tta_results = Trainer.test_with_TTA(eval_cfg, model)
+                    results.update(tta_results)
+
+                for dataset_name, dataset_results in results.items():
+                    result_key = f"{dataset_name}_mask_{mask_source}_box_{box_source}"
+                    merged_results[result_key] = dataset_results
     finally:
         if original_box_source is not None:
-            box_source_owner.instance_box_source = original_box_source
+            source_owner.instance_box_source = original_box_source
+        if original_mask_source is not None:
+            source_owner.instance_mask_source = original_mask_source
 
     return merged_results
 
@@ -645,7 +731,7 @@ def main(args):
         checkpointer.resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = run_dual_box_source_eval(cfg, model, args)
+        res = run_multi_source_instance_eval(cfg, model, args)
         if comm.is_main_process():
             verify_results(cfg, res)
         return res
@@ -657,6 +743,7 @@ def main(args):
         final_weights = os.path.join(cfg.OUTPUT_DIR, "model_final.pth")
         inference_weights = export_inference_checkpoint(final_weights)
         export_border_val_predictions(cfg, inference_weights or final_weights)
+        export_instance_val_predictions(cfg, inference_weights or final_weights)
     return train_result
 
 

@@ -1,0 +1,33 @@
+_BASE_: maskdino_R50_bs16_50ep_3s.yaml
+
+MODEL:
+  WEIGHTS: "output/251210_baseline/model_final_inference.pth"
+  BORDER_HEAD:
+    ENABLED: False
+    TRAIN_ONLY: False
+  INSTANCE_MASK_REFINE:
+    ENABLED: True
+    FREEZE_BASE: True
+    BACKBONE_DOWNSCALE_FACTOR: 0.5
+    HIDDEN_DIM: 256
+    IMAGE_HIDDEN_DIM: 64
+    FULL_RES_HIDDEN_DIM: 128
+    LOSS_WEIGHT: 1.0
+    MASK_WEIGHT: 5.0
+    DICE_WEIGHT: 5.0
+  MaskDINO:
+    TEST:
+      BOX_EVAL_SOURCES: ["pred", "mask"]
+      MASK_EVAL_SOURCES: ["auto", "coarse"]
+
+SOLVER:
+  IMS_PER_BATCH: 1
+  BASE_LR: 5.0e-05
+  MAX_ITER: 1000
+  STEPS: [700, 900]
+  CHECKPOINT_PERIOD: 1000
+
+TEST:
+  EVAL_PERIOD: 500
+
+OUTPUT_DIR: "./output/instance_refine_halfinput_r50_frozen"

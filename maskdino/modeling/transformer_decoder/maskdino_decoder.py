@@ -412,7 +412,7 @@ class MaskDINODecoder(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
+            outputs_class, outputs_mask, _ = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -451,7 +451,7 @@ class MaskDINODecoder(nn.Module):
 
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            outputs_class, outputs_mask, _ = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
         if self.dn != "no" and self.training and mask_dict is not None:
@@ -468,10 +468,13 @@ class MaskDINODecoder(nn.Module):
             valid_ratios=valid_ratios,
             tgt_mask=tgt_mask
         )
+        final_mask_embed = None
         for i, output in enumerate(hs):
-            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+            outputs_class, outputs_mask, mask_embed = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            if mask_embed is not None:
+                final_mask_embed = mask_embed
 
         # iteratively box prediction
         if self.initial_pred:
@@ -492,6 +495,7 @@ class MaskDINODecoder(nn.Module):
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes':out_boxes[-1],
+            'pred_mask_embed': final_mask_embed,
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask,out_boxes
             )
@@ -505,11 +509,12 @@ class MaskDINODecoder(nn.Module):
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         outputs_mask = None
+        mask_embed = None
         if pred_mask:
             mask_embed = self.mask_embed(decoder_output)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
-        return outputs_class, outputs_mask
+        return outputs_class, outputs_mask, mask_embed
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None):

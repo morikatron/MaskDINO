@@ -7,6 +7,7 @@
 import logging
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import torch
 from torch import nn
 
 from detectron2.config import configurable
@@ -16,6 +17,7 @@ from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 from ..transformer_decoder.maskdino_decoder import build_transformer_decoder
 from ..pixel_decoder.maskdino_encoder import build_pixel_decoder
 from .border_head import BorderSemanticHead
+from .instance_mask_refine_head import InstanceMaskRefineHead
 
 
 @SEM_SEG_HEADS_REGISTRY.register()
@@ -31,6 +33,7 @@ class MaskDINOHead(nn.Module):
         ignore_value: int = -1,
         transformer_predictor: nn.Module,
         border_head: Optional[nn.Module] = None,
+        instance_mask_refine_head: Optional[nn.Module] = None,
         border_train_only: bool = False,
     ):
         """
@@ -53,6 +56,7 @@ class MaskDINOHead(nn.Module):
         self.pixel_decoder = pixel_decoder
         self.predictor = transformer_predictor
         self.border_head = border_head
+        self.instance_mask_refine_head = instance_mask_refine_head
         self.border_train_only = border_train_only
 
         self.num_classes = num_classes
@@ -86,6 +90,17 @@ class MaskDINOHead(nn.Module):
                 if cfg.MODEL.BORDER_HEAD.ENABLED
                 else None
             ),
+            "instance_mask_refine_head": (
+                InstanceMaskRefineHead(
+                    mask_dim=cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
+                    low_level_channels=input_shape[cfg.MODEL.SEM_SEG_HEAD.IN_FEATURES[0]].channels,
+                    hidden_dim=cfg.MODEL.INSTANCE_MASK_REFINE.HIDDEN_DIM,
+                    image_hidden_dim=cfg.MODEL.INSTANCE_MASK_REFINE.IMAGE_HIDDEN_DIM,
+                    full_res_hidden_dim=cfg.MODEL.INSTANCE_MASK_REFINE.FULL_RES_HIDDEN_DIM,
+                )
+                if cfg.MODEL.INSTANCE_MASK_REFINE.ENABLED
+                else None
+            ),
             "border_train_only": cfg.MODEL.BORDER_HEAD.TRAIN_ONLY,
         }
 
@@ -109,5 +124,32 @@ class MaskDINOHead(nn.Module):
                 images,
                 output_size=output_size,
             )
+
+        if self.instance_mask_refine_head is not None and "pred_mask_embed" in predictions and images is not None:
+            output_size = images.shape[-2:]
+            refined_mask_features = self.instance_mask_refine_head(
+                mask_features,
+                features[self.border_low_level_feature],
+                images,
+                output_size=output_size,
+            )
+            coarse_masks = predictions.get("pred_masks")
+            pred_mask_embed = predictions["pred_mask_embed"]
+            if coarse_masks is not None and pred_mask_embed.shape[1] != coarse_masks.shape[1]:
+                pred_mask_embed = pred_mask_embed[:, -coarse_masks.shape[1] :, :]
+                predictions["pred_mask_embed"] = pred_mask_embed
+            residual_masks = torch.einsum(
+                "bqc,bchw->bqhw",
+                pred_mask_embed,
+                refined_mask_features,
+            )
+            if coarse_masks is not None and coarse_masks.shape[-2:] != output_size:
+                coarse_masks = nn.functional.interpolate(
+                    coarse_masks,
+                    size=output_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            predictions["pred_masks_refined"] = residual_masks if coarse_masks is None else coarse_masks + residual_masks
 
         return predictions, mask_dict
